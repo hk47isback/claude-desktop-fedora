@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Update Claude Desktop on Fedora: download the newest .deb from Anthropic's apt repo (or reuse the one you
+# already downloaded to your home folder), check its SHA-256 against the repo index, convert it to an .rpm
+# Fedora accepts, and install it.   NO_INSTALL=1 claude-desktop-update   builds the rpm but does not install.
+# Needs: alien fakeroot rpm-build dpkg curl python3.
+set -euo pipefail
+
+REPO=https://downloads.claude.ai/claude-desktop/apt/stable
+WORK=${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-fedora   # wiped and recreated on every run
+
+# newest "claude-desktop" entry in the repo index: version, pool path, sha256
+read -r VER FILE SHA < <(curl -fsS "$REPO/dists/stable/main/binary-amd64/Packages" | python3 -I -c '
+import sys,re
+best=None
+for blk in sys.stdin.read().split("\n\n"):
+    d=dict(re.findall(r"^([A-Za-z0-9-]+): (.*)$",blk,re.M))
+    if d.get("Package")=="claude-desktop":
+        k=tuple(int(x) for x in re.findall(r"\d+",d["Version"]))
+        if not best or k>best[0]: best=(k,d)
+d=best[1]; print(d["Version"],d["Filename"],d["SHA256"])')
+echo "newest published: $VER"
+
+HAVE=$(rpm -q --qf '%{VERSION}' claude-desktop 2>/dev/null || true)
+if [ "$HAVE" = "$VER" ]; then echo "already installed: $HAVE (nothing to do)"; exit 0; fi
+echo "installed: ${HAVE:-none}"
+
+rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
+DEB=claude-desktop_${VER}_amd64.deb
+for d in "$HOME" "$HOME/Downloads"; do                       # reuse a copy you already downloaded, if it is the right file
+    if [ -f "$d/$DEB" ] && echo "$SHA  $d/$DEB" | sha256sum -c --quiet - 2>/dev/null; then
+        cp "$d/$DEB" "$DEB"; echo "using the copy you already downloaded: $d/$DEB"; break
+    fi
+done
+[ -f "$DEB" ] || curl -fL --progress-bar -o "$DEB" "$REPO/$FILE"
+echo "$SHA  $DEB" | sha256sum -c -                          # aborts (set -e) if it does not match
+
+fakeroot alien --to-rpm --keep-version --target=x86_64 --generate "$DEB" >/dev/null
+TREE=$(ls -d claude-desktop-*/ | head -1); TREE=${TREE%/}
+SPEC=$(ls "$TREE"/*.spec)
+# Fedora's filesystem package owns /usr, /usr/bin, /usr/share/...: keep only our own directories in the package
+grep -v -E '^%dir ' "$SPEC" > "$WORK/pkg.spec"
+grep -E '^%dir "/usr/(lib|share/doc)/claude-desktop/' "$SPEC" > "$WORK/pkg.spec.dirs" || true
+python3 -I - "$WORK/pkg.spec" "$WORK/pkg.spec.dirs" <<'PY'
+import sys
+spec, dirs = sys.argv[1:3]
+s = open(spec).read().split("\n"); d = open(dirs).read().strip().split("\n")
+i = s.index("%files") + 1
+open(spec, "w").write("\n".join(s[:i] + d + s[i:]))
+PY
+rm -f "$SPEC"                                               # keep the spec out of the package payload
+# alien's spec writes the rpm to "../" relative to the current directory, so build from inside the tree
+(cd "$WORK/$TREE" && fakeroot rpmbuild --buildroot="$WORK/$TREE" -bb --target x86_64 "$WORK/pkg.spec") \
+    >"$WORK/rpmbuild.log" 2>&1 || { tail -n 20 "$WORK/rpmbuild.log"; exit 1; }
+RPM=$(ls "$WORK"/claude-desktop-*.rpm)
+if rpm -qp --dump "$RPM" | awk '$1=="/usr/bin"||$1=="/usr/lib"||$1=="/usr"||$1=="/"' | grep -q .; then
+    echo "package still claims system directories; not safe to install" >&2; exit 1; fi
+echo; echo "built: $RPM"
+if [ "${NO_INSTALL:-}" = 1 ]; then echo "install with:  sudo dnf5 install --no-gpgchecks $RPM"; exit 0; fi
+echo; echo "Installing. Afterwards quit Claude completely and reopen it (an open Claude chat ends)."
+echo "The rpm was built on this machine, so it has no signature: --no-gpgchecks is needed (RPM 6 requires signatures)."
+echo "Check the list below: it should upgrade ONLY claude-desktop. Answer N if it wants to add other packages."
+sudo dnf5 install --no-gpgchecks "$RPM"
